@@ -201,6 +201,168 @@ class GuardrailService:
         }
 
 
+@app.cls(
+    image=image,
+    gpu="T4",
+    scaledown_window=300,
+    memory=8192,  # 8GB RAM for loading both models
+    volumes={"/data": modal.Volume.from_name("guardrail-data")},
+)
+class CompareService:
+    """
+    Service that loads BOTH base and fine-tuned models for side-by-side comparison.
+    Used for demo purposes to show the improvement from fine-tuning.
+    """
+
+    @modal.enter()
+    def load_models(self):
+        """Load both models at container startup."""
+        import os
+
+        import torch
+        from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.models = {}
+
+        # Load base model
+        print(f"Loading base model: {PANGOLIN_BASE}")
+        base_tokenizer = AutoTokenizer.from_pretrained(PANGOLIN_BASE)
+        base_model = AutoModelForSequenceClassification.from_pretrained(PANGOLIN_BASE)
+        base_model.eval().to(self.device)
+        self.models["base"] = {
+            "model": base_model,
+            "tokenizer": base_tokenizer,
+            "version": "pangolin-base",
+        }
+
+        # Load fine-tuned model
+        finetuned_exists = os.path.exists(FINETUNED_MODEL) and os.path.exists(
+            os.path.join(FINETUNED_MODEL, "config.json")
+        )
+
+        if finetuned_exists:
+            print(f"Loading fine-tuned model: {FINETUNED_MODEL}")
+            ft_tokenizer = AutoTokenizer.from_pretrained(FINETUNED_MODEL)
+            ft_model = AutoModelForSequenceClassification.from_pretrained(FINETUNED_MODEL)
+            ft_model.eval().to(self.device)
+            self.models["finetuned"] = {
+                "model": ft_model,
+                "tokenizer": ft_tokenizer,
+                "version": "finetuned-v1",
+            }
+        else:
+            print("WARNING: Fine-tuned model not found, using base for both")
+            self.models["finetuned"] = self.models["base"]
+
+        print(f"Both models loaded on {self.device}")
+
+    def classify_with_model(self, text: str, model_key: str) -> dict:
+        """Classify text using specified model."""
+        import torch
+
+        start_time = time.time()
+
+        model_data = self.models[model_key]
+        tokenizer = model_data["tokenizer"]
+        model = model_data["model"]
+
+        inputs = tokenizer(
+            text,
+            return_tensors="pt",
+            truncation=True,
+            max_length=512,
+        )
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+
+        with torch.no_grad():
+            outputs = model(**inputs)
+            probs = torch.softmax(outputs.logits, dim=-1)
+            prediction = torch.argmax(probs, dim=-1).item()
+            confidence = probs[0][prediction].item()
+
+        latency_ms = (time.time() - start_time) * 1000
+
+        is_safe = prediction == 0
+        label = "safe" if is_safe else "unsafe"
+
+        return {
+            "is_safe": is_safe,
+            "label": label,
+            "confidence": round(confidence, 4),
+            "latency_ms": round(latency_ms, 2),
+            "model_version": model_data["version"],
+        }
+
+    def extract_content(self, request_body: dict) -> str:
+        """Extract text content from request."""
+        # Try to get from messages
+        messages = request_body.get("request", {}).get("json", {}).get("messages", [])
+        user_messages = [
+            m.get("content", "")
+            for m in messages
+            if m.get("role") == "user" and m.get("content")
+        ]
+
+        # Also check direct text field
+        text = request_body.get("request", {}).get("text", "")
+        if not text:
+            text = request_body.get("text", "")
+
+        all_content = "\n".join(user_messages)
+        if text and text not in all_content:
+            all_content = f"{all_content}\n{text}".strip()
+
+        return all_content
+
+    @modal.fastapi_endpoint(method="POST")
+    def compare(self, request_body: dict) -> dict:
+        """
+        Compare both base and fine-tuned models on the same input.
+
+        Returns results from both models for side-by-side comparison.
+        """
+        start_time = time.time()
+
+        content = self.extract_content(request_body)
+
+        if not content:
+            empty_result = {
+                "is_safe": True,
+                "label": "safe",
+                "confidence": 1.0,
+                "latency_ms": 0,
+                "reason": "No content to analyze",
+            }
+            return {
+                "base": empty_result,
+                "finetuned": empty_result,
+                "total_latency_ms": round((time.time() - start_time) * 1000, 2),
+            }
+
+        # Run both models
+        base_result = self.classify_with_model(content, "base")
+        finetuned_result = self.classify_with_model(content, "finetuned")
+
+        total_latency = (time.time() - start_time) * 1000
+
+        return {
+            "base": base_result,
+            "finetuned": finetuned_result,
+            "total_latency_ms": round(total_latency, 2),
+            "content_length": len(content),
+        }
+
+    @modal.fastapi_endpoint(method="GET")
+    def health(self) -> dict:
+        """Health check endpoint."""
+        return {
+            "status": "healthy",
+            "models_loaded": list(self.models.keys()),
+            "device": self.device,
+        }
+
+
 @app.local_entrypoint()
 def main():
     """Test the service locally."""
