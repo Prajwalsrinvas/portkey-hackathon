@@ -156,6 +156,79 @@ flowchart TB
     style W fill:#22c55e,stroke:#22c55e
 ```
 
+### Data Pipeline Diagram
+
+```mermaid
+flowchart TB
+    subgraph Sources["📥 External Sources (HuggingFace)"]
+        NI[("leolee99/NotInject<br/>339 samples<br/>ALL BENIGN")]
+        DS[("deepset/prompt-injections<br/>546 samples<br/>343 benign + 203 attacks")]
+    end
+
+    subgraph Download["Phase 1: Download"]
+        NI --> NI_FILE[external_notinject.jsonl<br/>339 samples]
+        DS --> DS_FILE[external_deepset.jsonl<br/>546 samples]
+    end
+
+    subgraph Combine["Phase 2: Combine & Split"]
+        NI_FILE --> BENIGN[All Benign<br/>339 + 343 = 682]
+        DS_FILE --> BENIGN
+        DS_FILE --> ATTACKS[All Attacks<br/>203]
+
+        BENIGN --> COMBINED[Combined Dataset<br/>885 samples<br/>77% benign, 23% attack]
+        ATTACKS --> COMBINED
+
+        COMBINED --> SPLIT{Stratified<br/>70/15/15 Split}
+
+        SPLIT --> TRAIN_REAL[train_notinject.jsonl<br/>619 samples]
+        SPLIT --> VAL[val_notinject.jsonl<br/>132 samples]
+        SPLIT --> TEST[test_notinject.jsonl<br/>134 samples]
+    end
+
+    subgraph Synthetic["Phase 3: Synthetic Generation"]
+        PORTKEY[("Portkey API<br/>+ Claude Sonnet 4.5<br/>+ Instructor")]
+
+        PORTKEY --> HN[Hard Negatives<br/>200 samples, label=0<br/>60% code snippets]
+        PORTKEY --> SA[Subtle Attacks<br/>100 samples, label=1<br/>Hidden in narratives]
+
+        HN --> SYNTH[synthetic_data.jsonl<br/>300 samples]
+        SA --> SYNTH
+    end
+
+    subgraph Final["Phase 4: Final Training Data"]
+        TRAIN_REAL --> COMBINED_TRAIN[train_combined.jsonl<br/>919 samples<br/>73% benign, 27% attack]
+        SYNTH --> COMBINED_TRAIN
+    end
+
+    subgraph Usage["Data Usage"]
+        COMBINED_TRAIN --> TRAINING[🔧 Fine-tuning]
+        VAL --> EARLY_STOP[⏹️ Early Stopping]
+        TEST --> EVAL[📊 Final Evaluation<br/>HELD-OUT]
+    end
+
+    style Sources fill:#1e3a5f,stroke:#4a9eff
+    style Download fill:#1e3a5f,stroke:#4a9eff
+    style Combine fill:#1e3a5f,stroke:#4a9eff
+    style Synthetic fill:#1e3a5f,stroke:#4a9eff
+    style Final fill:#1e3a5f,stroke:#4a9eff
+    style Usage fill:#1e3a5f,stroke:#4a9eff
+    style TEST fill:#ef4444,stroke:#ef4444
+    style COMBINED_TRAIN fill:#22c55e,stroke:#22c55e
+    style EVAL fill:#ef4444,stroke:#ef4444
+```
+
+### Data Summary Table
+
+| File | Source | Samples | Labels | Purpose |
+|------|--------|---------|--------|---------|
+| `external_notinject.jsonl` | HuggingFace | 339 | 100% benign | Raw benchmark |
+| `external_deepset.jsonl` | HuggingFace | 546 | 63% benign, 37% attack | Raw benchmark |
+| `train_notinject.jsonl` | 70% split | 619 | ~77% benign | Training (real) |
+| `val_notinject.jsonl` | 15% split | 132 | ~77% benign | Early stopping |
+| `test_notinject.jsonl` | 15% split | 134 | ~77% benign | **HELD-OUT** eval |
+| `synthetic_data.jsonl` | Claude via Portkey | 300 | 67% benign | Hard cases |
+| `train_combined.jsonl` | real + synthetic | 919 | ~73% benign | **FINAL TRAINING** |
+
 ### Why This Works
 
 ```mermaid
@@ -286,6 +359,62 @@ response = client.chat.completions.create(
 | Batch Size | 16 | Balance stability and speed |
 | Class Weights | safe=0.68, unsafe=1.90 | Handle 73/27 label imbalance |
 | GPU | Modal H100 | 12s total training time |
+
+## Evaluation Methodology
+
+Three-tier evaluation ensures the model works correctly:
+
+```mermaid
+flowchart TB
+    subgraph Tier1["📊 Tier 1: Held-Out Test (134 samples)"]
+        T1_DESC["15% of data NEVER seen during training or validation<br/>True measure of generalization"]
+        T1_METRICS["Metrics: Accuracy (97.0%), FP Rate (1.0%)"]
+        T1_DESC --> T1_METRICS
+    end
+
+    subgraph Tier2["🔍 Tier 2: Sanity Check (10 cases)"]
+        T2_DESC["Hand-crafted examples to verify model isn't broken"]
+        T2_CASES["3 basic safe + 3 hard negatives + 3 obvious attacks + 1 subtle"]
+        T2_DESC --> T2_CASES
+    end
+
+    subgraph Tier3["⚡ Tier 3: Challenge Test (22 edge cases)"]
+        T3_DESC["Hard cases targeting known failure patterns"]
+        T3_CAT1["Code samples (5): Python, JS, Rust with trigger words"]
+        T3_CAT2["Educational (2): Security class discussions"]
+        T3_CAT3["Subtle attacks (7): Fictional framing, roleplay, hypotheticals"]
+        T3_CAT4["Adversarial benign (3): Look like attacks but are safe"]
+        T3_DESC --> T3_CAT1
+        T3_DESC --> T3_CAT2
+        T3_DESC --> T3_CAT3
+        T3_DESC --> T3_CAT4
+    end
+
+    subgraph Flow["Evaluation Flow"]
+        TRAIN[Fine-tuning Complete] --> S1[Sanity Check]
+        S1 -->|Pass ≥80%| S2[Held-Out Test]
+        S2 --> S3[Challenge Test]
+        S3 --> DONE[Model Ready]
+    end
+
+    Tier1 --- Flow
+    Tier2 --- Flow
+    Tier3 --- Flow
+
+    style Tier1 fill:#1e3a5f,stroke:#4a9eff
+    style Tier2 fill:#1e3a5f,stroke:#4a9eff
+    style Tier3 fill:#1e3a5f,stroke:#4a9eff
+    style Flow fill:#1e3a5f,stroke:#4a9eff
+    style DONE fill:#22c55e,stroke:#22c55e
+```
+
+| Tier | Function | Samples | Purpose |
+|------|----------|---------|---------|
+| **Held-Out Test** | `evaluate_held_out_test()` | 134 | True generalization measure |
+| **Sanity Check** | `quick_sanity_check()` | 10 | Verify model isn't broken |
+| **Challenge Test** | `challenge_test()` | 22 | Edge case robustness (90.9%) |
+
+Run challenge test: `modal run scripts/finetune.py --challenge`
 
 ## Ablation Study
 

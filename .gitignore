@@ -5,3 +5,4 @@ __pycache__/
 
 # Project specific - large analysis files (reference only)
 analysis/pangolin_benchmark_100k.csv
+.vercel
